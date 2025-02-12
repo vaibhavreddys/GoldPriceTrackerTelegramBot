@@ -1,0 +1,6 @@
+services:
+  - type: worker  # Change from "web" to "worker"
+    name: GoldPriceTrackerTelegramBot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
