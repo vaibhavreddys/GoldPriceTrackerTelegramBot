@@ -35,12 +35,12 @@ def get_gold_prices():
     # Locate the section containing the table
     section = soup.find('section', {'data-gr-title': 'Today 22 Carat Gold Price Per Gram in Bangalore (INR)'})
     if not section:
-        return "Sorry, I couldn't find the gold price table."
+        return "Sorry, I couldn't find the gold price table, try again!"
 
     # Locate the table within the section
     table = section.find('table', {'class': 'table-conatiner'})
     if not table:
-        return "Sorry, I couldn't find the gold price table."
+        return "Sorry, I couldn't find the gold price information, try again!"
 
     # Extract table headers
     headers = [th.text.strip() for th in table.find('thead').find_all('th')]
