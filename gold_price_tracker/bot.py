@@ -1,11 +1,14 @@
+import os
 import requests
 from bs4 import BeautifulSoup
 import cloudscraper
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 
-# Replace 'YOUR_TOKEN' with your bot's token
-TOKEN = '7526275332:AAHr5WArN64S4exp7Ljj4xC7CCfxp0wrMH4'
+# Fetch the token from the environment variable
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise ValueError("No TOKEN environment variable found. Please set the TOKEN variable.")
 
 # Function to scrape the gold price table
 def get_gold_prices():
