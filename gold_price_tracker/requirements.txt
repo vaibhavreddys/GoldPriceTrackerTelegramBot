@@ -1,0 +1,4 @@
+python-telegram-bot
+cloudscraper
+beautifulsoup4
+requests
