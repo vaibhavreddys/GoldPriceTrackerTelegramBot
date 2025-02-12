@@ -1,3 +1,5 @@
+from flask import Flask, request, jsonify
+import threading
 import os
 import requests
 from bs4 import BeautifulSoup
@@ -9,6 +11,13 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("No TOKEN environment variable found. Please set the TOKEN variable.")
+
+# Create a Flask app for the dummy HTTP server
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return jsonify({"status": "ok", "message": "Server is running"})
 
 # Function to scrape the gold price table
 def get_gold_prices():
@@ -72,7 +81,16 @@ async def gold(update: Update, context: CallbackContext) -> None:
     gold_price_table = get_gold_prices()
     await update.message.reply_text(gold_price_table, parse_mode="HTML")
 
+# Open a port | Flask
+def start_dummy_server():
+    """Start the dummy HTTP server on port 10000."""
+    app.run(host="0.0.0.0", port=10000)
+
 def main() -> None:
+    # Start the dummy HTTP server in a separate thread
+    server_thread = threading.Thread(target=start_dummy_server)
+    server_thread.daemon = True  # Daemonize thread to exit when the main program exits
+    server_thread.start()
     # Create an Application object with your bot's token
     application = Application.builder().token(TOKEN).build()
 
