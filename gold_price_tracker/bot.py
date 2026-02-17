@@ -20,9 +20,11 @@ import time
 import logging
 import sqlite3
 import datetime
+import random
 from contextlib import contextmanager
 from bs4 import BeautifulSoup
 import cloudscraper
+import requests
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -83,6 +85,16 @@ CITIES = {
 
 DEFAULT_CITY  = "bangalore"
 DEFAULT_METAL = "gold"
+
+# User agents for rotation
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+]
 
 # ---------------------------------------------------------------------------
 # Flask health-check server
@@ -239,7 +251,7 @@ def _set_cache(metal: str, city: str, message: str, price: float):
     }
 
 # ---------------------------------------------------------------------------
-# Scraper
+# Scraper with multiple methods and fallback
 # ---------------------------------------------------------------------------
 
 def _parse_price_from_cell(text: str) -> float | None:
@@ -320,11 +332,143 @@ def _build_table_str(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _fetch_with_cloudscraper(url: str) -> requests.Response | None:
+    """Try fetching with cloudscraper (Solution 1)"""
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True,
+                'mobile': False
+            }
+        )
+        
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+        }
+        
+        response = scraper.get(url, headers=headers, timeout=15)
+        return response if response.status_code == 200 else None
+    except Exception as e:
+        logger.warning(f"Cloudscraper method failed: {e}")
+        return None
+
+
+def _fetch_with_requests_session(url: str) -> requests.Response | None:
+    """Try fetching with requests session (Solution 2)"""
+    try:
+        session = requests.Session()
+        
+        # First visit the homepage to get cookies
+        session.get(
+            "https://www.goodreturns.in/", 
+            headers={'User-Agent': random.choice(USER_AGENTS)},
+            timeout=10
+        )
+        
+        # Add small delay to appear more human-like
+        time.sleep(random.uniform(1, 3))
+        
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.goodreturns.in/',
+            'Origin': 'https://www.goodreturns.in',
+        }
+        
+        response = session.get(url, headers=headers, timeout=15)
+        return response if response.status_code == 200 else None
+    except Exception as e:
+        logger.warning(f"Requests session method failed: {e}")
+        return None
+
+
+def _parse_goodreturns_html(html_text: str, metal_info: dict, city_name: str, url: str) -> tuple[str | None, float | None]:
+    """Parse the HTML from goodreturns.in and return (message, price)"""
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        # Find the relevant section by checking data-gr-title contains the metal keyword
+        section = None
+        for sec in soup.find_all("section", attrs={"data-gr-title": True}):
+            title = sec.get("data-gr-title", "")
+            if metal_info["section_keyword"].lower() in title.lower():
+                section = sec
+                break
+
+        if not section:
+            logger.warning(f"Could not locate {metal_info['label']} price section")
+            return None, None
+
+        # 'table-conatiner' is a typo on the source website itself
+        table = section.find("table", {"class": "table-conatiner"})
+        if not table:
+            logger.warning(f"Could not find price table for {metal_info['label']}")
+            return None, None
+
+        thead = table.find("thead")
+        tbody = table.find("tbody")
+        if not thead or not tbody:
+            logger.warning("Malformed table structure")
+            return None, None
+
+        headers = [th.get_text(strip=True) for th in thead.find_all("th")]
+        if not headers:
+            logger.warning("Could not read table headers")
+            return None, None
+
+        raw_rows: list[list[str]] = []
+        for tr in tbody.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(cells) == len(headers):  # skip malformed / ad rows
+                raw_rows.append(cells)
+
+        if not raw_rows:
+            logger.warning("No data rows found in the table")
+            return None, None
+
+        # Extract the current price from the first data row, second column (index 1)
+        current_price: float | None = None
+        if len(raw_rows[0]) > 1:
+            current_price = _parse_price_from_cell(raw_rows[0][1])
+
+        table_str = _build_table_str(headers, raw_rows)
+
+        fetched_at = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p IST")
+        emoji      = metal_info["emoji"]
+        label      = metal_info["label"]
+
+        message = (
+            f"{emoji} <b>Today's {label} Prices in {city_name}</b> {emoji}\n\n"
+            f"<pre><code>{table_str}</code></pre>\n\n"
+            f"<i>🕐 Fetched at: {fetched_at}</i>\n"
+            f"<i>📊 Source: <a href=\"{url}\">GoodReturns.in</a></i>"
+        )
+
+        return message, current_price
+
+    except Exception as e:
+        logger.exception(f"Unexpected parse error: {e}")
+        return None, None
+
+
 def get_metal_prices(metal: str, city: str, force_refresh: bool = False) -> str:
     """
     Main scraping function. Returns a formatted HTML string for Telegram.
-    Raises ValueError for unsupported metal/city.
-    Raises RuntimeError on network or parse failures.
+    Tries multiple methods to fetch data, with fallback to clickable URL.
     """
     metal = metal.lower()
     city  = city.lower()
@@ -347,92 +491,52 @@ def get_metal_prices(metal: str, city: str, force_refresh: bool = False) -> str:
     city_name  = CITIES[city]
     url = f"https://www.goodreturns.in/{metal_info['url_slug']}/{city}.html"
 
-    # --- Network fetch ---
-    try:
-        scraper  = cloudscraper.create_scraper()
-        response = scraper.get(url, timeout=15)
-    except Exception as exc:
-        logger.error("Network error fetching %s: %s", url, exc)
-        raise RuntimeError("Network error while fetching prices. Try again later.") from exc
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Source website returned HTTP {response.status_code}. Try again later."
+    # Try multiple fetch methods
+    response = None
+    methods_tried = []
+    
+    # Method 1: Cloudscraper
+    logger.info(f"Trying cloudscraper method for {metal}/{city}")
+    methods_tried.append("cloudscraper")
+    response = _fetch_with_cloudscraper(url)
+    
+    # Method 2: Requests with session (if method 1 failed)
+    if not response:
+        logger.info(f"Cloudscraper failed, trying requests session for {metal}/{city}")
+        methods_tried.append("requests_session")
+        # Add a small delay between attempts
+        time.sleep(random.uniform(2, 4))
+        response = _fetch_with_requests_session(url)
+    
+    # If all methods failed, return clickable URL
+    if not response:
+        logger.error(f"All fetch methods failed for {metal}/{city}")
+        error_msg = (
+            f"⚠️ <b>Unable to fetch {metal_info['label']} prices automatically</b>\n\n"
+            f"The website is currently blocking automated requests.\n\n"
+            f"🔗 <b>Click here to check prices manually:</b>\n"
+            f"<a href='{url}'>{city_name} {metal_info['label']} Prices</a>\n\n"
+            f"<i>Methods tried: {', '.join(methods_tried)}</i>\n"
+            f"<i>Please try again in a few minutes.</i>"
         )
+        return error_msg
 
-    # --- Parse ---
-    try:
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        # Find the relevant section by checking data-gr-title contains the
-        # metal keyword — more resilient than an exact string match
-        section = None
-        for sec in soup.find_all("section", attrs={"data-gr-title": True}):
-            title = sec.get("data-gr-title", "")
-            if metal_info["section_keyword"].lower() in title.lower():
-                section = sec
-                break
-
-        if not section:
-            raise RuntimeError(
-                f"Could not locate the {metal_info['label']} price section. "
-                "The website layout may have changed."
-            )
-
-        # 'table-conatiner' is a typo on the source website itself
-        table = section.find("table", {"class": "table-conatiner"})
-        if not table:
-            raise RuntimeError(
-                f"Could not find the price table for {metal_info['label']}. "
-                "The website layout may have changed."
-            )
-
-        thead = table.find("thead")
-        tbody = table.find("tbody")
-        if not thead or not tbody:
-            raise RuntimeError("Malformed table structure on the source website.")
-
-        headers = [th.get_text(strip=True) for th in thead.find_all("th")]
-        if not headers:
-            raise RuntimeError("Could not read table headers.")
-
-        raw_rows: list[list[str]] = []
-        for tr in tbody.find_all("tr"):
-            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(cells) == len(headers):  # skip malformed / ad rows
-                raw_rows.append(cells)
-
-        if not raw_rows:
-            raise RuntimeError("No data rows found in the table.")
-
-        # Extract the current price from the first data row, second column (index 1)
-        current_price: float | None = None
-        if len(raw_rows[0]) > 1:
-            current_price = _parse_price_from_cell(raw_rows[0][1])
-
-        table_str = _build_table_str(headers, raw_rows)
-
-        fetched_at = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p IST")
-        emoji      = metal_info["emoji"]
-        label      = metal_info["label"]
-
-        message = (
-            f"{emoji} <b>Today's {label} Prices in {city_name}</b> {emoji}\n\n"
-            f"<pre><code>{table_str}</code></pre>\n\n"
-            f"<i>🕐 Fetched at: {fetched_at}</i>\n"
-            f"<i>📊 Source: <a href=\"{url}\">GoodReturns.in</a></i>"
-        )
-
-        _set_cache(metal, city, message, current_price or 0.0)
+    # Parse the HTML
+    message, current_price = _parse_goodreturns_html(response.text, metal_info, city_name, url)
+    
+    if message and current_price:
+        _set_cache(metal, city, message, current_price)
         return message
-
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        logger.exception("Unexpected parse error for %s/%s: %s", metal, city, exc)
-        raise RuntimeError(
-            "Unexpected error while processing price data. Try again later."
-        ) from exc
+    else:
+        # Parsing failed - return clickable URL as fallback
+        error_msg = (
+            f"⚠️ <b>Unable to parse {metal_info['label']} prices</b>\n\n"
+            f"The website layout may have changed.\n\n"
+            f"🔗 <b>Click here to check prices manually:</b>\n"
+            f"<a href='{url}'>{city_name} {metal_info['label']} Prices</a>\n\n"
+            f"<i>The bot developers have been notified of this issue.</i>"
+        )
+        return error_msg
 
 # ---------------------------------------------------------------------------
 # Helpers for command handlers
@@ -457,7 +561,7 @@ async def _fetch_and_reply(
     loading = await update.message.reply_text("⏳ Fetching prices, please wait…")
     try:
         text = get_metal_prices(metal, city, force_refresh=force)
-        await loading.edit_text(text, parse_mode="HTML")
+        await loading.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
     except ValueError as exc:
         await loading.edit_text(f"❌ {exc}")
     except RuntimeError as exc:
@@ -694,6 +798,7 @@ async def job_daily_prices(context: CallbackContext) -> None:
                 chat_id=chat_id,
                 text=header + msg,
                 parse_mode="HTML",
+                disable_web_page_preview=True,
             )
         except Exception as exc:
             logger.warning("Failed to send daily update to %s: %s", chat_id, exc)
