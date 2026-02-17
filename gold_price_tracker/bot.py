@@ -782,20 +782,28 @@ def main() -> None:
     application.add_handler(CommandHandler("cancelalert",  cmd_cancelalert))
     application.add_handler(CommandHandler("status",       cmd_status))
 
-    # 9:00 AM IST = 03:30 UTC
-    application.job_queue.run_daily(
-        job_daily_prices,
-        time=datetime.time(3, 30, 0, tzinfo=datetime.timezone.utc),
-        name="daily_prices",
-    )
-
-    # Alert check every hour
-    application.job_queue.run_repeating(
-        job_check_alerts,
-        interval=ALERT_CHECK_INTERVAL,
-        first=60,  # first run 60 seconds after startup
-        name="alert_check",
-    )
+    # Schedule background jobs -- requires python-telegram-bot[job-queue]
+    if application.job_queue is None:
+        logger.critical(
+            "JobQueue is not available. Background jobs (daily prices, alerts) are DISABLED.\n"
+            "Fix: pip install \"python-telegram-bot[job-queue]\"\n"
+            "     Ensure your requirements.txt has:  python-telegram-bot[job-queue]"
+        )
+    else:
+        # 9:00 AM IST = 03:30 UTC
+        application.job_queue.run_daily(
+            job_daily_prices,
+            time=datetime.time(3, 30, 0, tzinfo=datetime.timezone.utc),
+            name="daily_prices",
+        )
+        # Alert check every hour
+        application.job_queue.run_repeating(
+            job_check_alerts,
+            interval=ALERT_CHECK_INTERVAL,
+            first=60,
+            name="alert_check",
+        )
+        logger.info("JobQueue active: daily prices at 09:00 IST, alerts every %ds.", ALERT_CHECK_INTERVAL)
 
     logger.info("Bot started. Polling for updates…")
     application.run_polling()
